@@ -58,8 +58,9 @@ def grad_cam(keras_model, img: Image.Image, alpha=0.40):
                                 [keras_model.get_layer(layer_name).output, keras_model.output])
     with tf.GradientTape() as tape:
         conv_out, preds = grad_model(x)
-        class_idx = int(tf.argmax(preds[0]).numpy())
-        loss = preds[:, class_idx]
+        preds = tf.cast(preds, tf.float32)
+        class_idx = int(tf.argmax(preds[0]))
+        loss = preds[0, class_idx]
     grads = tape.gradient(loss, conv_out)[0]
     weights = tf.reduce_mean(grads, axis=(0,1))
     cam = tf.reduce_sum(tf.multiply(weights, conv_out[0]), axis=-1)
