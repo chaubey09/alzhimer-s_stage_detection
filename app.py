@@ -65,7 +65,7 @@ def grad_cam(keras_model, img: Image.Image, alpha=0.40):
         tape.watch(inputs)
         conv_out, preds = grad_model(inputs, training=False)
         # safely get class index
-        preds_np = preds.numpy()
+        preds_np = np.array(preds)
         class_idx = int(np.argmax(preds_np[0]))
         loss = preds[0][class_idx]
 
