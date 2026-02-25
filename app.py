@@ -64,10 +64,8 @@ def grad_cam(keras_model, img: Image.Image, alpha=0.40):
         inputs = tf.constant(x)
         tape.watch(inputs)
         conv_out, preds = grad_model(inputs, training=False)
-        # safely get class index
-        preds_np = np.array(preds)
-        class_idx = int(np.argmax(preds_np[0]))
-        loss = preds[0][class_idx]
+        class_idx = int(np.argmax(np.array(preds)[0]))
+        loss = tf.reduce_sum(preds * tf.one_hot([class_idx], preds.shape[-1]))
 
     grads = tape.gradient(loss, conv_out)
     if grads is None:
