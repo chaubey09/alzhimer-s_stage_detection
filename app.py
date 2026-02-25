@@ -1,10 +1,7 @@
-# streamlit_app.py
-# Brain MRI — Alzheimer’s Stage Classifier (EffNetV2-B0, 300x300)
-# Expects these files in the SAME folder as this app:
-#   - brain_effv2b0_infer.keras   (preferred)  OR  brain_savedmodel/ (fallback)
-#   - labels.json
-
+# app.py
+# Brain MRI — Alzheimer's Stage Classifier (EffNetV2-B0, 300x300)
 from pathlib import Path
+import json
 import numpy as np
 from PIL import Image
 
@@ -18,11 +15,11 @@ from tensorflow.keras.applications.efficientnet_v2 import preprocess_input as v2
 APP_DIR = Path(__file__).parent.resolve()
 KERAS_PATH = APP_DIR / "brain_effv2b0_infer.keras"
 LABELS_PATH = APP_DIR / "labels.json"
-SAVEDMODEL_DIR = APP_DIR / "brain_savedmodel"   # contains saved_model.pb if used
+SAVEDMODEL_DIR = APP_DIR / "brain_savedmodel"
 IMG_SZ = 300
 
 st.set_page_config(page_title="Brain MRI Classifier", layout="wide")
-st.title("🧠 Brain MRI — Alzheimer’s Stage Classifier")
+st.title("🧠 Brain MRI — Alzheimer's Stage Classifier")
 
 # ---------- utilities ----------
 def load_labels(path: Path):
@@ -46,56 +43,77 @@ def get_last_conv_name(keras_model):
     return last
 
 def grad_cam(keras_model, img: Image.Image, alpha=0.40):
-    if not hasattr(keras_model, "layers") or not keras_model.layers:
+    try:
+        if not hasattr(keras_model, "layers") or not keras_model.layers:
+            return None
+        layer_name = get_last_conv_name(keras_model)
+        if layer_name is None:
+            return None
+
+        x = preprocess_pil(img)
+        x_tensor = tf.constant(x, dtype=tf.float32)
+
+        grad_model = tf.keras.Model(
+            inputs=keras_model.inputs,
+            outputs=[keras_model.get_layer(layer_name).output, keras_model.output]
+        )
+
+        # --- Step 1: Run once OUTSIDE tape to safely get class index ---
+        conv_out_val, preds_val = grad_model(x_tensor, training=False)
+        preds_np = np.array(preds_val)          # safe numpy conversion
+        class_idx = int(np.argmax(preds_np[0])) # plain Python int
+        num_classes = preds_np.shape[-1]         # plain Python int
+
+        # --- Step 2: Build one-hot as a numpy array (no TF shape issues) ---
+        one_hot_np = np.zeros((1, num_classes), dtype=np.float32)
+        one_hot_np[0, class_idx] = 1.0
+        one_hot = tf.constant(one_hot_np)
+
+        # --- Step 3: Run INSIDE tape, watch conv output directly ---
+        with tf.GradientTape() as tape:
+            conv_out_tape, preds_tape = grad_model(x_tensor, training=False)
+            tape.watch(conv_out_tape)
+            loss = tf.reduce_sum(preds_tape * one_hot)
+
+        grads = tape.gradient(loss, conv_out_tape)
+        if grads is None:
+            st.warning("Grad-CAM: gradients were None.")
+            return None
+
+        # --- Step 4: Convert everything to NumPy for safety ---
+        grads_np = np.array(grads[0])       # (H, W, C)
+        conv_np  = np.array(conv_out_tape[0])  # (H, W, C)
+
+        weights = np.mean(grads_np, axis=(0, 1))          # (C,)
+        cam = np.sum(weights * conv_np, axis=-1)           # (H, W)
+        cam = np.maximum(cam, 0)
+        cam_max = np.max(cam)
+        if cam_max == 0:
+            return None
+        cam = cam / (cam_max + 1e-8)
+
+        # --- Step 5: Resize using PIL (no TF needed) ---
+        cam_img = Image.fromarray((cam * 255).astype(np.uint8)).resize(
+            (IMG_SZ, IMG_SZ), Image.BILINEAR
+        )
+        cam_resized = np.array(cam_img) / 255.0
+
+        base    = np.array(img.convert("RGB").resize((IMG_SZ, IMG_SZ)), np.float32) / 255.0
+        heat    = plt.cm.jet(cam_resized)[..., :3]
+        overlay = np.clip((1 - alpha) * base + alpha * heat, 0, 1)
+        return (overlay * 255).astype(np.uint8)
+
+    except Exception as e:
+        st.warning(f"Grad-CAM failed: {str(e)}")
         return None
-    layer_name = get_last_conv_name(keras_model)
-    if layer_name is None:
-        return None
-
-    x = preprocess_pil(img)
-    x = tf.cast(x, tf.float32)
-
-    grad_model = tf.keras.Model(
-        inputs=keras_model.inputs,
-        outputs=[keras_model.get_layer(layer_name).output, keras_model.output]
-    )
-
-    with tf.GradientTape() as tape:
-        inputs = tf.constant(x)
-        tape.watch(inputs)
-        conv_out, preds = grad_model(inputs, training=False)
-        class_idx = int(np.argmax(np.array(preds)[0]))
-        loss = tf.reduce_sum(preds * tf.one_hot([class_idx], preds.shape[-1]))
-
-    grads = tape.gradient(loss, conv_out)
-    if grads is None:
-        return None
-
-    grads = grads[0]
-    weights = tf.reduce_mean(grads, axis=(0, 1))
-    cam = tf.reduce_sum(tf.multiply(weights, conv_out[0]), axis=-1)
-    cam = tf.maximum(cam, 0)
-    cam_max = tf.reduce_max(cam)
-    if cam_max == 0:
-        return None
-    cam = cam / (cam_max + 1e-8)
-    cam = tf.image.resize(cam[..., None], (IMG_SZ, IMG_SZ)).numpy().squeeze()
-
-    base = np.array(img.convert("RGB").resize((IMG_SZ, IMG_SZ)), np.float32) / 255.0
-    heat = plt.cm.jet(cam)[..., :3]
-    overlay = np.clip((1 - alpha) * base + alpha * heat, 0, 1)
-    return (overlay * 255).astype(np.uint8)
 
 # ---------- load model & labels ----------
-import json
 try:
     class_names = load_labels(LABELS_PATH)
 except Exception as e:
     st.error(f"Could not read labels.json: {e}")
     st.stop()
 
-# Try .keras first (needs exact custom object key used during save),
-# else fall back to SavedModel.
 try:
     if KERAS_PATH.exists():
         model = load_model(str(KERAS_PATH),
@@ -110,7 +128,7 @@ try:
                 out = serving(tf.constant(x))
                 return next(iter(out.values())).numpy()
             @property
-            def layers(self):  # for Grad-CAM guard
+            def layers(self):
                 return []
         model = Wrap()
         is_keras = False
@@ -146,6 +164,9 @@ if file:
     st.pyplot(fig, use_container_width=True)
 
     if show_cam and is_keras:
-        overlay = grad_cam(model, img)
+        with st.spinner("Generating Grad-CAM..."):
+            overlay = grad_cam(model, img)
         if overlay is not None:
             st.image(overlay, caption="Grad-CAM overlay", use_container_width=True)
+        else:
+            st.info("Grad-CAM could not be generated for this image.")
