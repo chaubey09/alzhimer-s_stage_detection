@@ -46,7 +46,6 @@ def get_last_conv_name(keras_model):
     return last
 
 def grad_cam(keras_model, img: Image.Image, alpha=0.40):
-    # Only available when loading the .keras model (SavedModel wrapper has no layers)
     if not hasattr(keras_model, "layers") or not keras_model.layers:
         return None
     layer_name = get_last_conv_name(keras_model)
@@ -54,17 +53,34 @@ def grad_cam(keras_model, img: Image.Image, alpha=0.40):
         return None
 
     x = preprocess_pil(img)
-    grad_model = tf.keras.Model([keras_model.inputs],
-                                [keras_model.get_layer(layer_name).output, keras_model.output])
+    x = tf.cast(x, tf.float32)
+
+    grad_model = tf.keras.Model(
+        inputs=keras_model.inputs,
+        outputs=[keras_model.get_layer(layer_name).output, keras_model.output]
+    )
+
     with tf.GradientTape() as tape:
-        conv_out, preds = grad_model(x)
-        preds = tf.cast(preds, tf.float32)
-        class_idx = int(tf.argmax(preds[0]))
-        loss = preds[0, class_idx]
-    grads = tape.gradient(loss, conv_out)[0]
-    weights = tf.reduce_mean(grads, axis=(0,1))
+        inputs = tf.constant(x)
+        tape.watch(inputs)
+        conv_out, preds = grad_model(inputs, training=False)
+        # safely get class index
+        preds_np = preds.numpy()
+        class_idx = int(np.argmax(preds_np[0]))
+        loss = preds[0][class_idx]
+
+    grads = tape.gradient(loss, conv_out)
+    if grads is None:
+        return None
+
+    grads = grads[0]
+    weights = tf.reduce_mean(grads, axis=(0, 1))
     cam = tf.reduce_sum(tf.multiply(weights, conv_out[0]), axis=-1)
-    cam = tf.maximum(cam, 0) / (tf.reduce_max(cam) + 1e-8)
+    cam = tf.maximum(cam, 0)
+    cam_max = tf.reduce_max(cam)
+    if cam_max == 0:
+        return None
+    cam = cam / (cam_max + 1e-8)
     cam = tf.image.resize(cam[..., None], (IMG_SZ, IMG_SZ)).numpy().squeeze()
 
     base = np.array(img.convert("RGB").resize((IMG_SZ, IMG_SZ)), np.float32) / 255.0
